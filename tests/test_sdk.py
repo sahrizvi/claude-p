@@ -5,6 +5,7 @@ from claude_p import ClaudePOptions
 from claude_p.cli import (
     ASSISTANT_MARKERS,
     build_tui_env,
+    build_usage_from_persisted,
     classify_failure,
     extract_assistant_snapshot,
     is_terminal_assistant_message,
@@ -141,3 +142,88 @@ def test_extract_assistant_snapshot_prefers_latest_marker_across_variants():
 
 def test_extract_assistant_snapshot_returns_empty_when_no_marker():
     assert extract_assistant_snapshot("just some text without any marker") == ""
+
+
+def test_read_persisted_assistant_returns_non_terminal_when_require_terminal_false(
+    tmp_path, monkeypatch
+):
+    # Regression: TUI-driven sessions write assistant entries with
+    # `stop_reason: null` because the wrapper SIGTERMs claude before
+    # the model finalizes its stop_reason. The wrapper now calls
+    # read_persisted_assistant with require_terminal=False so the
+    # JSONL passthrough path doesn't silently fall back to TUI
+    # screen-scraping. Verify the function returns the latest
+    # assistant entry even when no entry is terminal.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    session_id = "22222222-2222-4222-8222-222222222222"
+    session_dir = tmp_path / ".claude" / "projects" / "-tmp-tui"
+    session_dir.mkdir(parents=True)
+    path = session_dir / f"{session_id}.jsonl"
+    lines = [
+        {
+            "type": "assistant",
+            "requestId": "req_012ABC",
+            "message": {
+                "id": "msg_only",
+                "model": "haiku",
+                "stop_reason": None,
+                "content": [{"type": "text", "text": "TUI_DRIVEN_OK"}],
+                "usage": {
+                    "input_tokens": 12,
+                    "output_tokens": 3,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                },
+            },
+        }
+    ]
+    path.write_text("\n".join(json.dumps(line) for line in lines))
+
+    result = read_persisted_assistant(session_id, require_terminal=False)
+
+    assert result is not None
+    assert result["text"] == "TUI_DRIVEN_OK"
+    assert result["terminal"] is False
+    assert result["request_id"] == "req_012ABC"
+    assert result["usage"]["output_tokens"] == 3
+
+
+def test_build_usage_from_persisted_reshapes_real_counters():
+    # The persisted JSONL carries claude's real usage counters. The
+    # wrapper reshapes them into the SDK-compatible envelope (with
+    # iterations + server_tool_use + cache_creation defaults filled).
+    persisted = {
+        "usage": {
+            "input_tokens": 42,
+            "output_tokens": 17,
+            "cache_creation_input_tokens": 18020,
+            "cache_read_input_tokens": 0,
+            "service_tier": "standard",
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 18020,
+                "ephemeral_1h_input_tokens": 0,
+            },
+        }
+    }
+    usage = build_usage_from_persisted(persisted)
+    assert usage["input_tokens"] == 42
+    assert usage["output_tokens"] == 17
+    assert usage["cache_creation_input_tokens"] == 18020
+    assert usage["service_tier"] == "standard"
+    assert usage["iterations"][0]["input_tokens"] == 42
+    assert usage["iterations"][0]["output_tokens"] == 17
+    # Defaults filled when missing fields.
+    assert usage["server_tool_use"] == {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0,
+    }
+
+
+def test_build_usage_from_persisted_tolerates_missing_usage():
+    # Edge case: persisted entry exists but `message.usage` is
+    # absent. Helper must not crash — return shape-compatible
+    # envelope with null/zero placeholders.
+    usage = build_usage_from_persisted({})
+    assert usage["input_tokens"] is None
+    assert usage["output_tokens"] == 0
+    assert usage["iterations"][0]["type"] == "message"

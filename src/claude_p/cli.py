@@ -205,6 +205,44 @@ def classify_interactive_block(text: str) -> str | None:
     return None
 
 
+def build_usage_from_persisted(persisted: dict) -> dict:
+    """Build a stream-json `usage` envelope from claude's real JSONL.
+
+    The persisted assistant entry carries a `usage` dict with real
+    counters (`input_tokens`, `output_tokens`, `cache_creation_*`,
+    `cache_read_input_tokens`, `service_tier`). Reshape into the
+    SDK-compatible envelope structure that `--output-format json` /
+    `stream-json` consumers expect.
+    """
+    real = persisted.get("usage") or {}
+    output_tokens = real.get("output_tokens") or 0
+    cache_creation = real.get("cache_creation") or {
+        "ephemeral_1h_input_tokens": None,
+        "ephemeral_5m_input_tokens": None,
+    }
+    return {
+        "input_tokens": real.get("input_tokens"),
+        "cache_creation_input_tokens": real.get("cache_creation_input_tokens"),
+        "cache_read_input_tokens": real.get("cache_read_input_tokens"),
+        "output_tokens": output_tokens,
+        "server_tool_use": real.get(
+            "server_tool_use", {"web_search_requests": 0, "web_fetch_requests": 0}
+        ),
+        "service_tier": real.get("service_tier"),
+        "cache_creation": cache_creation,
+        "iterations": [
+            {
+                "input_tokens": real.get("input_tokens"),
+                "output_tokens": output_tokens,
+                "cache_read_input_tokens": real.get("cache_read_input_tokens"),
+                "cache_creation_input_tokens": real.get("cache_creation_input_tokens"),
+                "cache_creation": cache_creation,
+                "type": "message",
+            }
+        ],
+    }
+
+
 def build_usage(output_text: str) -> dict:
     # The TUI does not expose reliable token/cost data. Keep shape-compatible
     # fields with null/zero values and mark the source in result metadata.
@@ -314,6 +352,12 @@ def read_persisted_assistant(session_id: str, *, require_terminal: bool = False)
                     "usage": message.get("usage"),
                     "stop_reason": message.get("stop_reason"),
                     "terminal": terminal,
+                    # requestId is on the outer JSONL event, not the
+                    # inner message. It's the canonical Anthropic
+                    # request identifier — surfacing it lets callers
+                    # correlate with server-side logs and confirms
+                    # the wrapper isn't synthesizing IDs.
+                    "request_id": event.get("requestId"),
                 }
     except OSError:
         return None
@@ -714,7 +758,16 @@ def main() -> int:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(transcript)
 
-    persisted = read_persisted_assistant(args.session_id, require_terminal=True)
+    # Accept the latest assistant entry regardless of `stop_reason`.
+    # In TUI-driven sessions claude writes assistant entries with
+    # `stop_reason: null` (only finalized at session-end, which the
+    # wrapper never reaches because it SIGTERMs claude after extracting
+    # the answer). With `require_terminal=True` the function returned
+    # `None`, the wrapper fell back to lossy TUI screen-scraping, and
+    # `session_jsonl` was `null` in the result envelope. The TUI is
+    # already idle (run_tui returned), so any assistant entry the
+    # function picks up is the final one for this turn.
+    persisted = read_persisted_assistant(args.session_id, require_terminal=False)
     answer = persisted["text"] if persisted else tui_answer
     final_answer_source = "session_jsonl" if persisted else "tui_transcript"
     if persisted and tui_answer and tui_answer != persisted["text"]:
@@ -743,7 +796,11 @@ def main() -> int:
 
     failure = classify_failure(transcript, answer, timed_out)
     is_error = failure is not None
-    usage = build_usage(answer)
+    # When the persisted JSONL is available, use claude's real usage
+    # counters (input_tokens, output_tokens, cache_*); otherwise fall
+    # back to the word-count approximation that build_usage emits.
+    usage = build_usage_from_persisted(persisted) if persisted else build_usage(answer)
+    request_id = persisted.get("request_id") if persisted else None
     duration_ms = now_ms(start)
 
     if args.output_format == "text":
@@ -790,32 +847,38 @@ def main() -> int:
         )
         return 0 if not is_error else 2
 
-    emit(
-        {
-            "type": "assistant",
-            "message": {
-                "model": final_model,
-                "id": message_id,
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "text", "text": answer}] if answer else [],
-                "stop_reason": "end_turn" if not is_error else None,
-                "stop_sequence": None,
-                "stop_details": None,
-                "usage": {
-                    "input_tokens": None,
-                    "cache_creation_input_tokens": None,
-                    "cache_read_input_tokens": None,
-                    "output_tokens": usage["output_tokens"],
-                    "service_tier": None,
-                },
-                "context_management": None,
+    # When we have a real persisted assistant entry, surface real
+    # token counts + the canonical Anthropic requestId. Otherwise
+    # keep the prior null/approx envelope so callers that handle
+    # both paths don't choke on shape changes.
+    assistant_envelope = {
+        "type": "assistant",
+        "message": {
+            "model": final_model,
+            "id": message_id,
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": answer}] if answer else [],
+            "stop_reason": "end_turn" if not is_error else None,
+            "stop_sequence": None,
+            "stop_details": None,
+            "usage": {
+                "input_tokens": usage.get("input_tokens"),
+                "cache_creation_input_tokens": usage.get("cache_creation_input_tokens"),
+                "cache_read_input_tokens": usage.get("cache_read_input_tokens"),
+                "output_tokens": usage["output_tokens"],
+                "service_tier": usage.get("service_tier"),
             },
-            "parent_tool_use_id": None,
-            "session_id": args.session_id,
-            "uuid": str(uuid.uuid4()),
-        }
-    )
+            "context_management": None,
+        },
+        "parent_tool_use_id": None,
+        "session_id": args.session_id,
+        "uuid": str(uuid.uuid4()),
+    }
+    if request_id:
+        assistant_envelope["requestId"] = request_id
+
+    emit(assistant_envelope)
     emit(
         {
             "type": "stream_event",
@@ -889,7 +952,6 @@ def main() -> int:
                 "timed_out": timed_out,
                 "exit_code": exit_code,
                 "extraction_confidence": "high" if persisted else ("medium" if answer else "none"),
-                "compatibility_note": "Shape-compatible with claude -p stream-json core events; usage/cost/tool events are best-effort because TUI has no machine protocol.",
             },
         }
     )
