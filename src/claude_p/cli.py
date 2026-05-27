@@ -508,15 +508,32 @@ def run_tui(args: argparse.Namespace, stream_json: bool) -> tuple[str, str, int 
                     break
 
             if last_snapshot and time.time() - last_output >= args.quiet_after_sec:
-                persisted = read_persisted_assistant(args.session_id)
-                # Idle for quiet_after_sec: stop whether the model
-                # marked terminal (explicit done), the JSONL has any
-                # text-bearing assistant entry (idle = done for TUI
-                # sessions where stop_reason stays null), or there's
-                # no assistant entry at all (nothing to wait for).
-                if not persisted or persisted.get("terminal") or persisted.get("text"):
-                    timed_out = False
-                    break
+                # The TUI shows "(Esc to interrupt" while claude is
+                # actively working — thinking, mid-tool-call, or
+                # waiting on a tool result. PTY output during this
+                # phase can be sparse (the spinner only redraws on
+                # interval), so the quiet_after_sec timer can fire
+                # mid-turn. Guard against bailing while claude is
+                # still working by checking the most recent TUI
+                # snapshot for the active-work marker.
+                tail_buf = raw.decode("utf-8", "replace")[-4096:]
+                if "(Esc to interrupt" in tail_buf or "Esc to interrupt" in clean_terminal(tail_buf):
+                    # Claude is still actively working. Reset the
+                    # idle timer so we don't immediately retry the
+                    # check on the next pass (the PTY tick that
+                    # rendered the spinner counts as recent output).
+                    last_output = time.time()
+                else:
+                    persisted = read_persisted_assistant(args.session_id)
+                    # Idle for quiet_after_sec and TUI not showing
+                    # active-work marker: stop whether the model
+                    # marked terminal (explicit done), the JSONL has
+                    # any text-bearing assistant entry (TUI session
+                    # idle with text written = done), or no entry
+                    # at all (nothing to wait for).
+                    if not persisted or persisted.get("terminal") or persisted.get("text"):
+                        timed_out = False
+                        break
             if proc.poll() is not None:
                 timed_out = False
                 break
