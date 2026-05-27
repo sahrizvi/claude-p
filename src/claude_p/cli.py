@@ -484,9 +484,22 @@ def run_tui(args: argparse.Namespace, stream_json: bool) -> tuple[str, str, int 
 
             # The terminal surface is not a stable completion signal across
             # Claude Code versions and terminal modes. Poll the canonical
-            # session JSONL while the TUI is running, and finish only after the
-            # current session has a terminal assistant message. Tool-use turns
-            # can also contain text and must not be mistaken for final output.
+            # session JSONL while the TUI is running. Exit strategy:
+            #
+            #   * Fast path: persisted message has stop_reason ∈ terminal
+            #     (end_turn / max_tokens / stop_sequence) → model explicitly
+            #     finalized, break immediately.
+            #
+            #   * Idle path: TUI quiescent for quiet_after_sec AND the
+            #     session JSONL has at least one assistant message →
+            #     claude went idle after writing a turn. TUI-driven
+            #     sessions never produce a terminal stop_reason (claude
+            #     only finalizes that field at session-end, which the
+            #     wrapper never reaches), so the fast path is unreachable
+            #     here and idle-detection is the actual exit signal.
+            #
+            #   * Empty path: TUI quiescent for quiet_after_sec AND no
+            #     assistant message yet → give up; claude never started.
             if now - last_jsonl_poll >= 0.5:
                 last_jsonl_poll = now
                 persisted = read_persisted_assistant(args.session_id)
@@ -496,7 +509,12 @@ def run_tui(args: argparse.Namespace, stream_json: bool) -> tuple[str, str, int 
 
             if last_snapshot and time.time() - last_output >= args.quiet_after_sec:
                 persisted = read_persisted_assistant(args.session_id)
-                if not persisted or persisted.get("terminal"):
+                # Idle for quiet_after_sec: stop whether the model
+                # marked terminal (explicit done), the JSONL has any
+                # text-bearing assistant entry (idle = done for TUI
+                # sessions where stop_reason stays null), or there's
+                # no assistant entry at all (nothing to wait for).
+                if not persisted or persisted.get("terminal") or persisted.get("text"):
                     timed_out = False
                     break
             if proc.poll() is not None:
